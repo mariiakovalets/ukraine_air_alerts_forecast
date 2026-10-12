@@ -18,12 +18,14 @@ from features import (
     FEATURES, HORIZON, build_features, build_target, load_alerts, load_all_alerts, make_grid,
 )
 
+# name -> (start, end, refit interval). Validation refits weekly to keep the long window fast;
+# the test refits daily, as the model would run in practice.
 PERIODS = {
-    "val": (pd.Timestamp("2026-07-13", tz="UTC"), pd.Timestamp("2026-08-10", tz="UTC")),
-    "test": (pd.Timestamp("2026-08-10", tz="UTC"), pd.Timestamp("2026-09-07", tz="UTC")),
+    "val": (pd.Timestamp("2026-01-05", tz="UTC"), pd.Timestamp("2026-08-10", tz="UTC"), pd.Timedelta(days=7)),
+    "test": (pd.Timestamp("2026-08-10", tz="UTC"), pd.Timestamp("2026-09-07", tz="UTC"), pd.Timedelta(days=1)),
 }
 BASELINE_WINDOW = pd.Timedelta(days=28)
-REFIT_EVERY = pd.Timedelta(days=1)
+DECAY_HALF_LIFE = pd.Timedelta(days=90)
 PROB_CLIP = 1e-3
 SEED = 42
 
@@ -51,7 +53,28 @@ def make_hgb() -> HistGradientBoostingClassifier:
     )
 
 
-MODELS = {"logreg": make_logreg, "hgb": make_hgb}
+# name -> (model factory, use time-decay sample weights)
+MODELS = {
+    "logreg": (make_logreg, False),
+    "logreg_decay90": (make_logreg, True),
+    "hgb": (make_hgb, False),
+    "hgb_decay90": (make_hgb, True),
+}
+
+
+def decay_weights(train_index: pd.DatetimeIndex, now: pd.Timestamp) -> np.ndarray:
+    age = (now - train_index) / DECAY_HALF_LIFE
+    return 0.5 ** age.to_numpy(dtype=float)
+
+
+def fit_model(make_model, use_decay: bool, X_tr: pd.DataFrame, y_tr: pd.Series, now: pd.Timestamp):
+    model = make_model()
+    if not use_decay:
+        return model.fit(X_tr, y_tr)
+    weights = decay_weights(X_tr.index, now)
+    if isinstance(model, Pipeline):
+        return model.fit(X_tr, y_tr, model__sample_weight=weights)
+    return model.fit(X_tr, y_tr, sample_weight=weights)
 
 
 def baseline_predictions(known_y: pd.Series, known_hours: pd.Series, day_hours: pd.Series) -> dict:
@@ -65,18 +88,19 @@ def baseline_predictions(known_y: pd.Series, known_hours: pd.Series, day_hours: 
     }
 
 
-def rolling_predict(X: pd.DataFrame, y: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+def rolling_predict(X: pd.DataFrame, y: pd.Series, start, end, refit_every) -> pd.DataFrame:
     rows = []
-    for day_start in pd.date_range(start, end, freq=REFIT_EVERY, inclusive="left"):
-        day_mask = (X.index >= day_start) & (X.index < day_start + REFIT_EVERY)
+    for day_start in pd.date_range(start, end, freq=refit_every, inclusive="left"):
+        day_mask = (X.index >= day_start) & (X.index < min(day_start + refit_every, end))
         # A training row's target window [t, t + H) must be over before the first forecast of the day
         train_mask = X.index + HORIZON <= day_start
         assert X.index[train_mask].max() + HORIZON <= X.index[day_mask].min()
 
         X_tr, y_tr, X_day = X[train_mask], y[train_mask], X[day_mask]
         preds = baseline_predictions(y_tr, X_tr["hour_local"], X_day["hour_local"])
-        for name, make_model in MODELS.items():
-            preds[name] = make_model().fit(X_tr, y_tr).predict_proba(X_day)[:, 1]
+        for name, (make_model, use_decay) in MODELS.items():
+            model = fit_model(make_model, use_decay, X_tr, y_tr, day_start)
+            preds[name] = model.predict_proba(X_day)[:, 1]
 
         rows.append(pd.DataFrame({"target": y[day_mask], **preds}, index=X_day.index))
     return pd.concat(rows)
@@ -118,8 +142,8 @@ def main() -> int:
     X = build_features(alerts, all_alerts, times)
     y = build_target(alerts, times)
 
-    start, end = PERIODS[args.period]
-    pred = rolling_predict(X, y, start, end)
+    start, end, refit_every = PERIODS[args.period]
+    pred = rolling_predict(X, y, start, end, refit_every)
     pred.to_csv(OUT_DIR / f"{args.period}_predictions.csv")
 
     table = score(pred)

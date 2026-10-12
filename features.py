@@ -31,6 +31,7 @@ NEIGHBOR_FEATURES = [
     "neighbors_active",
     "oblasts_active_ukraine",
     "neighbor_start_1h",
+    "neighbors_active_kyiv_quiet",
 ]
 FEATURES = [
     *COUNT_WINDOWS, "alert_active", "minutes_since_last_start", "hour_local", "dow_local",
@@ -119,6 +120,8 @@ def build_features(alerts: pd.DataFrame, all_alerts: pd.DataFrame, times: pd.Dat
     ns = np.sort(_ns(all_alerts.loc[all_alerts["oblast"].isin(NEIGHBORS), "started_at"]))
     recent_starts = np.searchsorted(ns, t, side="left") - np.searchsorted(ns, t - NEIGHBOR_START_WINDOW.value, side="left")
     out["neighbor_start_1h"] = (recent_starts > 0).astype(int)
+    # A new Kyiv alert cannot start while the current one is still running
+    out["neighbors_active_kyiv_quiet"] = out["neighbors_active"] * (1 - out["alert_active"])
     return out[FEATURES]
 
 
@@ -147,4 +150,5 @@ def features_from_history(history: pd.DataFrame, all_history: pd.DataFrame, t: p
 
     neighbor_starts = all_history.loc[all_history["oblast"].isin(NEIGHBORS), "started_at"]
     row["neighbor_start_1h"] = int((neighbor_starts >= t - NEIGHBOR_START_WINDOW).any())
+    row["neighbors_active_kyiv_quiet"] = row["neighbors_active"] * (1 - row["alert_active"])
     return row
